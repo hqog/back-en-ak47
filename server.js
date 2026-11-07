@@ -24,13 +24,13 @@ app.use(cookieParser());
 
 // Soldes de crédits envoyés par le bot : { userId: nombre }. Gardés en mémoire,
 // le bot les renvoie toutes les minutes (donc rien à perdre si Render redémarre).
-let creditsByUser = {};
+let snapshot = { users: {}, admin: null, adminIds: [] };
 let creditsUpdatedAt = null;
 
 app.get('/', (_req, res) => res.send('API OK'));
 
 // Appelé uniquement par le bot (pas par le navigateur) : protégé par le secret partagé.
-app.post('/internal/credits', express.json({ limit: '5mb' }), (req, res) => {
+app.post('/internal/credits', express.json({ limit: '20mb' }), (req, res) => {
   if (!SYNC_SECRET) {
     console.warn('[sync] SYNC_SECRET est vide ou absent sur ce service : ajoute-la dans Environment puis redéploie.');
     return res.status(503).json({ error: 'SYNC_SECRET non configurée sur le backend' });
@@ -42,10 +42,11 @@ app.post('/internal/credits', express.json({ limit: '5mb' }), (req, res) => {
     console.warn(`[sync] Secret refusé (reçu : ${given.length} caractères, attendu : ${expected.length}).`);
     return res.status(401).json({ error: 'Non autorisé' });
   }
-  if (!req.body || typeof req.body.credits !== 'object' || req.body.credits === null) {
+  if (!req.body || typeof req.body.users !== 'object' || req.body.users === null) {
     return res.status(400).json({ error: 'Corps invalide' });
   }
-  creditsByUser = req.body.credits;
+  const { users, admin = null, adminIds = [] } = req.body;
+  snapshot = { users, admin, adminIds };
   creditsUpdatedAt = Date.now();
   res.json({ ok: true });
 });
@@ -118,12 +119,16 @@ app.get('/api/me', (req, res) => {
   const token = (req.headers.authorization || '').replace('Bearer ', '');
   try {
     const { id, username, avatar } = jwt.verify(token, JWT_SECRET);
+    const isAdmin = snapshot.adminIds.includes(id);
+    const mine = snapshot.users[id] || {};
     res.json({
-      id, username, avatar,
-      // null = le bot n'a pas encore envoyé ses données (Render vient de démarrer)
-      credits: creditsUpdatedAt ? (creditsByUser[id] ?? 0) : null,
-      creditsUpdatedAt,
+      id, username, avatar, isAdmin,
+      synced: Boolean(creditsUpdatedAt),   // false = le bot n'a pas encore envoyé ses données
+      updatedAt: creditsUpdatedAt,
+      data: creditsUpdatedAt ? { credits: 0, bots: [], redeemed: [], referral: { count: 0, paid: 0, earned: 0 }, vouches: { count: 0, last: [] }, economy: null, ...mine } : null,
+      admin: isAdmin ? snapshot.admin : null,
     });
+
   } catch {
     res.status(401).json({ error: 'Non connecté' });
   }
