@@ -10,6 +10,7 @@ const {
   BACKEND_URL,   // ex: https://mon-backend.onrender.com
   FRONTEND_URL,  // ex: https://mon-frontend.onrender.com (sans / final)
   JWT_SECRET,
+  SYNC_SECRET,   // secret partagé avec le bot (même valeur que SITE_SYNC_SECRET côté bot)
   PORT = 3000,
 } = process.env;
 
@@ -20,7 +21,26 @@ app.set('trust proxy', 1);
 app.use(cors({ origin: FRONTEND_URL }));
 app.use(cookieParser());
 
+// Soldes de crédits envoyés par le bot : { userId: nombre }. Gardés en mémoire,
+// le bot les renvoie toutes les minutes (donc rien à perdre si Render redémarre).
+let creditsByUser = {};
+let creditsUpdatedAt = null;
+
 app.get('/', (_req, res) => res.send('API OK'));
+
+// Appelé uniquement par le bot (pas par le navigateur) : protégé par le secret partagé.
+app.post('/internal/credits', express.json({ limit: '5mb' }), (req, res) => {
+  const given = Buffer.from(String(req.headers['x-sync-secret'] || ''));
+  const expected = Buffer.from(String(SYNC_SECRET || ''));
+  const ok = expected.length > 0 && given.length === expected.length && crypto.timingSafeEqual(given, expected);
+  if (!ok) return res.status(401).json({ error: 'Non autorisé' });
+  if (!req.body || typeof req.body.credits !== 'object' || req.body.credits === null) {
+    return res.status(400).json({ error: 'Corps invalide' });
+  }
+  creditsByUser = req.body.credits;
+  creditsUpdatedAt = Date.now();
+  res.json({ ok: true });
+});
 
 // 1) Redirige vers Discord
 app.get('/auth/discord', (_req, res) => {
@@ -90,7 +110,12 @@ app.get('/api/me', (req, res) => {
   const token = (req.headers.authorization || '').replace('Bearer ', '');
   try {
     const { id, username, avatar } = jwt.verify(token, JWT_SECRET);
-    res.json({ id, username, avatar });
+    res.json({
+      id, username, avatar,
+      // null = le bot n'a pas encore envoyé ses données (Render vient de démarrer)
+      credits: creditsUpdatedAt ? (creditsByUser[id] ?? 0) : null,
+      creditsUpdatedAt,
+    });
   } catch {
     res.status(401).json({ error: 'Non connecté' });
   }
