@@ -19,12 +19,18 @@ const REDIRECT_URI = `${BACKEND_URL}/auth/discord/callback`;
 
 const app = express();
 app.set('trust proxy', 1);
-app.use(cors({ origin: FRONTEND_URL }));
+app.use(cors({ origin: FRONTEND_URL, methods: ['GET', 'POST'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 app.use(cookieParser());
 
 // Soldes de crédits envoyés par le bot : { userId: nombre }. Gardés en mémoire,
 // le bot les renvoie toutes les minutes (donc rien à perdre si Render redémarre).
-let snapshot = { users: {}, admin: null, adminIds: [] };
+let snapshot = { users: {}, admin: null, adminIds: [], plans: [] };
+const actions = new Map();   // id -> { id, uid, payload, status: 'pending'|'sent'|'done', result }
+const userOf = (req) => { try { return jwt.verify((req.headers.authorization || '').replace('Bearer ', ''), JWT_SECRET); } catch { return null; } };
+const secretOk = (req) => {
+  const g = Buffer.from(String(req.headers['x-sync-secret'] || '').trim()), e = Buffer.from(SYNC_SECRET);
+  return e.length > 0 && g.length === e.length && crypto.timingSafeEqual(g, e);
+};
 let creditsUpdatedAt = null;
 
 app.get('/', (_req, res) => res.send('API OK'));
@@ -45,8 +51,8 @@ app.post('/internal/credits', express.json({ limit: '20mb' }), (req, res) => {
   if (!req.body || typeof req.body.users !== 'object' || req.body.users === null) {
     return res.status(400).json({ error: 'Corps invalide' });
   }
-  const { users, admin = null, adminIds = [] } = req.body;
-  snapshot = { users, admin, adminIds };
+  const { users, admin = null, adminIds = [], plans = [] } = req.body;
+  snapshot = { users, admin, adminIds, plans };
   creditsUpdatedAt = Date.now();
   res.json({ ok: true });
 });
@@ -115,6 +121,37 @@ app.get('/auth/discord/callback', async (req, res) => {
 });
 
 // 3) API protégée
+// --- Actions demandées par le membre depuis le panel (exécutées par le bot) ---
+app.post('/api/actions', express.json(), (req, res) => {
+  const me = userOf(req);
+  if (!me) return res.status(401).json({ error: 'Non connecté' });
+  const b = req.body || {};
+  if (!['renew', 'settings'].includes(b.type) || typeof b.key !== 'string') return res.status(400).json({ error: 'Action invalide' });
+  for (const [k, a] of actions) if (Date.now() - a.at > 10 * 60 * 1000) actions.delete(k);   // ménage
+  const id = crypto.randomBytes(8).toString('hex');
+  actions.set(id, { id, uid: me.id, at: Date.now(), status: 'pending', result: null, payload: {
+    type: b.type, key: b.key, days: Number(b.days) || 0, presence: String(b.presence || ''),
+    activityType: String(b.activityType || ''), activityText: String(b.activityText || '').slice(0, 128) } });
+  res.json({ id });
+});
+app.get('/api/actions/:id', (req, res) => {
+  const me = userOf(req), a = actions.get(req.params.id);
+  if (!me || !a || a.uid !== me.id) return res.status(404).json({ error: 'Introuvable' });
+  res.json({ status: a.status, result: a.result });
+});
+app.get('/internal/actions', (req, res) => {
+  if (!secretOk(req)) return res.status(401).json({ error: 'Non autorisé' });
+  const out = [...actions.values()].filter((a) => a.status === 'pending');
+  out.forEach((a) => { a.status = 'sent'; });
+  res.json({ actions: out.map(({ id, uid, payload }) => ({ id, uid, payload })) });
+});
+app.post('/internal/actions/:id/result', express.json(), (req, res) => {
+  if (!secretOk(req)) return res.status(401).json({ error: 'Non autorisé' });
+  const a = actions.get(req.params.id);
+  if (a) { a.status = 'done'; a.result = req.body; }
+  res.json({ ok: true });
+});
+
 app.get('/api/me', (req, res) => {
   const token = (req.headers.authorization || '').replace('Bearer ', '');
   try {
@@ -127,6 +164,7 @@ app.get('/api/me', (req, res) => {
       updatedAt: creditsUpdatedAt,
       data: creditsUpdatedAt ? { credits: 0, bots: [], redeemed: [], referral: { count: 0, paid: 0, earned: 0 }, vouches: { count: 0, last: [] }, economy: null, ...mine } : null,
       admin: isAdmin ? snapshot.admin : null,
+      plans: snapshot.plans,
     });
 
   } catch {
