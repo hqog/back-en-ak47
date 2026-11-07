@@ -24,7 +24,7 @@ app.use(cookieParser());
 
 // Soldes de crédits envoyés par le bot : { userId: nombre }. Gardés en mémoire,
 // le bot les renvoie toutes les minutes (donc rien à perdre si Render redémarre).
-let snapshot = { users: {}, admin: null, adminIds: [], plans: [] };
+let snapshot = { users: {}, admin: null, adminIds: [], plans: [], groups: [], invitePerms: '8' };
 const actions = new Map();   // id -> { id, uid, payload, status: 'pending'|'sent'|'done', result }
 const userOf = (req) => { try { return jwt.verify((req.headers.authorization || '').replace('Bearer ', ''), JWT_SECRET); } catch { return null; } };
 const secretOk = (req) => {
@@ -51,8 +51,8 @@ app.post('/internal/credits', express.json({ limit: '20mb' }), (req, res) => {
   if (!req.body || typeof req.body.users !== 'object' || req.body.users === null) {
     return res.status(400).json({ error: 'Corps invalide' });
   }
-  const { users, admin = null, adminIds = [], plans = [] } = req.body;
-  snapshot = { users, admin, adminIds, plans };
+  const { users, admin = null, adminIds = [], plans = [], groups = [], invitePerms = '8' } = req.body;
+  snapshot = { users, admin, adminIds, plans, groups, invitePerms };
   creditsUpdatedAt = Date.now();
   res.json({ ok: true });
 });
@@ -126,11 +126,14 @@ app.post('/api/actions', express.json(), (req, res) => {
   const me = userOf(req);
   if (!me) return res.status(401).json({ error: 'Non connecté' });
   const b = req.body || {};
-  if (!['renew', 'settings'].includes(b.type) || typeof b.key !== 'string') return res.status(400).json({ error: 'Action invalide' });
+  const needsBot = ['renew', 'settings', 'groups'].includes(b.type);
+  if (!['renew', 'settings', 'groups', 'promo', 'promo_create', 'credits'].includes(b.type) || (needsBot && typeof b.key !== 'string')) return res.status(400).json({ error: 'Action invalide' });
   for (const [k, a] of actions) if (Date.now() - a.at > 10 * 60 * 1000) actions.delete(k);   // ménage
   const id = crypto.randomBytes(8).toString('hex');
   actions.set(id, { id, uid: me.id, at: Date.now(), status: 'pending', result: null, payload: {
-    type: b.type, key: b.key, days: Number(b.days) || 0, presence: String(b.presence || ''),
+    type: b.type, key: String(b.key || ''), code: String(b.code || '').slice(0, 40), credits: Number(b.credits) || 0, maxUses: Number(b.maxUses) || 0,
+    expiresDays: Number(b.expiresDays) || 0, targetId: String(b.targetId || '').slice(0, 25), amount: Number(b.amount) || 0,
+    groups: Array.isArray(b.groups) ? b.groups.slice(0, 40).map(String) : [], days: Number(b.days) || 0, presence: String(b.presence || ''),
     activityType: String(b.activityType || ''), activityText: String(b.activityText || '').slice(0, 128) } });
   res.json({ id });
 });
@@ -164,7 +167,7 @@ app.get('/api/me', (req, res) => {
       updatedAt: creditsUpdatedAt,
       data: creditsUpdatedAt ? { credits: 0, bots: [], redeemed: [], referral: { count: 0, paid: 0, earned: 0 }, vouches: { count: 0, last: [] }, economy: null, ...mine } : null,
       admin: isAdmin ? snapshot.admin : null,
-      plans: snapshot.plans,
+      plans: snapshot.plans, groups: snapshot.groups, invitePerms: snapshot.invitePerms,
     });
 
   } catch {
