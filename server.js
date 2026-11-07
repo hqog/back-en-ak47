@@ -10,9 +10,10 @@ const {
   BACKEND_URL,   // ex: https://mon-backend.onrender.com
   FRONTEND_URL,  // ex: https://mon-frontend.onrender.com (sans / final)
   JWT_SECRET,
-  SYNC_SECRET,   // secret partagé avec le bot (même valeur que SITE_SYNC_SECRET côté bot)
+  SYNC_SECRET: RAW_SYNC_SECRET,   // secret partagé avec le bot (même valeur que SITE_SYNC_SECRET côté bot)
   PORT = 3000,
 } = process.env;
+const SYNC_SECRET = (RAW_SYNC_SECRET || '').trim();   // enlève les espaces invisibles éventuels
 
 const REDIRECT_URI = `${BACKEND_URL}/auth/discord/callback`;
 
@@ -30,10 +31,17 @@ app.get('/', (_req, res) => res.send('API OK'));
 
 // Appelé uniquement par le bot (pas par le navigateur) : protégé par le secret partagé.
 app.post('/internal/credits', express.json({ limit: '5mb' }), (req, res) => {
-  const given = Buffer.from(String(req.headers['x-sync-secret'] || ''));
-  const expected = Buffer.from(String(SYNC_SECRET || ''));
-  const ok = expected.length > 0 && given.length === expected.length && crypto.timingSafeEqual(given, expected);
-  if (!ok) return res.status(401).json({ error: 'Non autorisé' });
+  if (!SYNC_SECRET) {
+    console.warn('[sync] SYNC_SECRET est vide ou absent sur ce service : ajoute-la dans Environment puis redéploie.');
+    return res.status(503).json({ error: 'SYNC_SECRET non configurée sur le backend' });
+  }
+  const given = Buffer.from(String(req.headers['x-sync-secret'] || '').trim());
+  const expected = Buffer.from(SYNC_SECRET);
+  const ok = given.length === expected.length && crypto.timingSafeEqual(given, expected);
+  if (!ok) {
+    console.warn(`[sync] Secret refusé (reçu : ${given.length} caractères, attendu : ${expected.length}).`);
+    return res.status(401).json({ error: 'Non autorisé' });
+  }
   if (!req.body || typeof req.body.credits !== 'object' || req.body.credits === null) {
     return res.status(400).json({ error: 'Corps invalide' });
   }
