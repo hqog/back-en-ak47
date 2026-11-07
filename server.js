@@ -42,6 +42,7 @@ const ACTION_TTL_MS = 10 * 60 * 1000;
 const MAX_ACTIONS_TOTAL = 2000;
 const MAX_ACTIVE_PER_USER = 5;
 const MAX_ACTIONS_PER_MINUTE = 15;
+const MAX_PROMO_TRIES_PER_HOUR = 10;
 
 const SNOWFLAKE = /^\d{15,25}$/;
 const NONCE_RE = /^[a-f0-9]{16,64}$/;
@@ -59,12 +60,17 @@ const secretOk = (req) => safeEq(String(req.headers['x-sync-secret'] || '').trim
 const int = (v, min, max) => { const x = Number(v); return Number.isSafeInteger(x) && x >= min && x <= max ? x : null; };
 const clean = (s, max) => String(s ?? '').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, max);
 
+// Identifiant opaque d'un bot : la vraie clé ne quitte jamais le serveur.
+const botRef = (key) => crypto.createHmac('sha256', JWT_SECRET).update('bot:' + String(key)).digest('hex').slice(0, 24);
+const BOT_REF_RE = /^[a-f0-9]{24}$/;
+const revoked = new Map();   // jti -> expiration (secondes) des tokens déconnectés
+
 const userOf = (req) => {
   const m = /^Bearer (.+)$/.exec(req.headers.authorization || '');
   if (!m) return null;
   try {
     const p = jwt.verify(m[1], JWT_SECRET, { algorithms: ['HS256'] });
-    return p && typeof p.id === 'string' && SNOWFLAKE.test(p.id) ? p : null;
+    return p && typeof p.id === 'string' && SNOWFLAKE.test(p.id) && typeof p.jti === 'string' && !revoked.has(p.jti) ? p : null;
   } catch { return null; }
 };
 const requireUser = (req, res, next) => {
@@ -90,10 +96,14 @@ let snapshot = { users: {}, admin: null, adminIds: [], plans: [], groups: [], in
 let creditsUpdatedAt = null;
 const actions = new Map();   // id -> { id, uid, at, payload, status: 'pending'|'sent'|'done', result }
 const hits = new Map();      // uid -> timestamps des dernières demandes
+const promoHits = new Map(); // uid -> timestamps des essais de code promo
+const adminLog = [];         // journal des actions admin (en mémoire, 300 max)
 
 setInterval(() => {
   const now = Date.now();
   for (const [k, a] of actions) if (now - a.at > ACTION_TTL_MS) actions.delete(k);
+  for (const [k, exp] of revoked) if (exp * 1000 < now) revoked.delete(k);
+  for (const [k, arr] of promoHits) { const f = arr.filter((t) => now - t < 3_600_000); f.length ? promoHits.set(k, f) : promoHits.delete(k); }
   for (const [k, arr] of hits) { const f = arr.filter((t) => now - t < 60_000); f.length ? hits.set(k, f) : hits.delete(k); }
 }, 30_000).unref();
 
@@ -103,6 +113,14 @@ const tooFast = (uid) => {
   arr.push(now);
   hits.set(uid, arr);
   return arr.length > MAX_ACTIONS_PER_MINUTE;
+};
+
+const promoTooFast = (uid) => {
+  const now = Date.now();
+  const arr = (promoHits.get(uid) || []).filter((t) => now - t < 3_600_000);
+  arr.push(now);
+  promoHits.set(uid, arr);
+  return arr.length > MAX_PROMO_TRIES_PER_HOUR;
 };
 
 // ───────────────────────── App ─────────────────────────
@@ -148,6 +166,8 @@ app.post('/internal/actions/:id/result', internalFailLimiter, requireSync, expre
     const r = req.body && typeof req.body === 'object' ? req.body : {};
     a.result = { ok: r.ok === true, message: clean(r.message, 300), error: clean(r.error, 300) };
     a.status = 'done';
+    const entry = adminLog.find((x) => x.id === a.id);
+    if (entry) { entry.status = a.result.ok ? 'done' : 'failed'; entry.message = a.result.ok ? a.result.message : a.result.error; }
   }
   res.json({ ok: true });
 });
@@ -217,7 +237,7 @@ app.get('/auth/discord/callback', authLimiter, async (req, res) => {
     const token = jwt.sign(
       { id: u.id, username: clean(u.global_name || u.username, 64), avatar: avatarUrl },
       JWT_SECRET,
-      { algorithm: 'HS256', expiresIn: '7d' }
+      { algorithm: 'HS256', expiresIn: '1d', jwtid: crypto.randomBytes(12).toString('hex') }
     );
 
     // Token + nonce dans le fragment (#) : jamais envoyés à un serveur
@@ -241,11 +261,11 @@ function buildPayload(me, b) {
   };
 
   if (BOT_TYPES.includes(type)) {
-    if (typeof b.key !== 'string' || !b.key || b.key.length > 200) return { status: 400, error: 'Action invalide' };
+    if (typeof b.key !== 'string' || !BOT_REF_RE.test(b.key)) return { status: 400, error: 'Action invalide' };
     const mine = snapshot.users[me.id];
-    const owns = Array.isArray(mine?.bots) && mine.bots.some((x) => x && x.key === b.key);
-    if (!owns) return { status: 403, error: 'Interdit' };
-    p.key = b.key;
+    const bot = Array.isArray(mine?.bots) ? mine.bots.find((x) => x && x.key != null && safeEq(botRef(x.key), b.key)) : null;
+    if (!bot) return { status: 403, error: 'Interdit' };
+    p.key = String(bot.key);
   }
 
   switch (type) {
@@ -304,6 +324,7 @@ app.post('/api/actions', requireUser, express.json({ limit: '10kb' }), (req, res
 
   const r = buildPayload(me, req.body && typeof req.body === 'object' ? req.body : {});
   if (!r.payload) return res.status(r.status).json({ error: r.error });
+  if (r.payload.type === 'promo' && promoTooFast(me.id)) return res.status(429).json({ error: 'Trop d’essais de code, réessaie plus tard.' });
 
   if (actions.size >= MAX_ACTIONS_TOTAL) return res.status(503).json({ error: 'Service surchargé, réessaie.' });
   let active = 0;
@@ -312,6 +333,11 @@ app.post('/api/actions', requireUser, express.json({ limit: '10kb' }), (req, res
 
   const id = crypto.randomBytes(8).toString('hex');
   actions.set(id, { id, uid: me.id, at: Date.now(), status: 'pending', result: null, payload: r.payload });
+  if (ADMIN_TYPES.includes(r.payload.type)) {
+    const { type, code, credits, maxUses, expiresDays, targetId, amount } = r.payload;
+    adminLog.unshift({ id, at: Date.now(), adminId: me.id, admin: me.username, type, code, credits, maxUses, expiresDays, targetId, amount, status: 'pending', message: '' });
+    if (adminLog.length > 300) adminLog.length = 300;
+  }
   res.json({ id });
 });
 
@@ -319,6 +345,24 @@ app.get('/api/actions/:id', requireUser, (req, res) => {
   const a = actions.get(req.params.id);
   if (!a || a.uid !== req.user.id) return res.status(404).json({ error: 'Introuvable' });
   res.json({ status: a.status, result: a.result });
+});
+
+const requireAdmin = (req, res, next) => (snapshot.adminIds.includes(req.user.id) ? next() : res.status(403).json({ error: 'Interdit' }));
+
+app.get('/api/admin/log', requireUser, requireAdmin, (_req, res) => res.json({ log: adminLog.slice(0, 100) }));
+
+app.get('/api/admin/user/:id', requireUser, requireAdmin, (req, res) => {
+  const id = String(req.params.id || '').trim();
+  if (!SNOWFLAKE.test(id)) return res.status(400).json({ error: 'ID invalide' });
+  const u = snapshot.users[id];
+  if (!u || typeof u !== 'object') return res.status(404).json({ error: 'Membre introuvable' });
+  const bots = Array.isArray(u.bots) ? u.bots.filter((x) => x && typeof x === 'object').map((x) => ({ ...x, key: botRef(x.key) })) : [];
+  res.json({ id, data: { credits: 0, redeemed: [], referral: { count: 0, paid: 0, earned: 0 }, vouches: { count: 0, last: [] }, economy: null, ...u, bots } });
+});
+
+app.post('/api/logout', requireUser, (req, res) => {
+  revoked.set(req.user.jti, req.user.exp);   // le token devient inutilisable immédiatement
+  res.json({ ok: true });
 });
 
 app.get('/api/me', requireUser, (req, res) => {
@@ -329,7 +373,7 @@ app.get('/api/me', requireUser, (req, res) => {
     id, username, avatar, isAdmin,
     synced: Boolean(creditsUpdatedAt),   // false = le bot n'a pas encore envoyé ses données
     updatedAt: creditsUpdatedAt,
-    data: creditsUpdatedAt ? { credits: 0, bots: [], redeemed: [], referral: { count: 0, paid: 0, earned: 0 }, vouches: { count: 0, last: [] }, economy: null, ...mine } : null,
+    data: creditsUpdatedAt ? { credits: 0, bots: [], redeemed: [], referral: { count: 0, paid: 0, earned: 0 }, vouches: { count: 0, last: [] }, economy: null, ...mine, bots: Array.isArray(mine.bots) ? mine.bots.filter((x) => x && typeof x === 'object').map((x) => ({ ...x, key: botRef(x.key) })) : [] } : null,
     admin: isAdmin ? snapshot.admin : null,
     plans: snapshot.plans, groups: snapshot.groups, invitePerms: snapshot.invitePerms,
   });
